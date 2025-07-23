@@ -28,3 +28,279 @@ H      5.57210    1.43600   -1.73190
 H      5.20640   -0.74330   -1.02920
 H      1.90890   -0.81600    3.06750
 H      0.53330   -0.45460    3.68720
+
+
+from rdkit import Chem
+from rdkit.Chem import AllChem
+import random
+from collections import Counter
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ─── 1. モノマー定義 ───
+monomers = {
+    "A": {"smiles": "OC(CC)CC(=O)O", "ends": ["OH", "COOH"]},
+    "B": {"smiles": "OCCO", "ends": ["OH", "OH"]},
+    "C": {"smiles": "OC(=O)CCC(=O)O", "ends": ["COOH", "COOH"]},
+    "D": {"smiles": "OC(=O)CCCOC(=O)O", "ends": ["COOH", "COOH"]},
+    "E": {"smiles": "NCCN", "ends": ["NH2", "NH2"]},
+    "F": {"smiles": "NCCO", "ends": ["NH2", "OH"]},
+}
+mole_ratio = {"A": 0.4, "B": 0.2, "C": 0.15, "D": 0.15, "E": 0.05, "F": 0.05}
+TOTAL_UNITS = 100
+
+# ─── 2. 反応 SMARTS ───
+reactions = [
+    # エステル化反応 (COOH + OH)
+    AllChem.ReactionFromSmarts("[C:1](=[O:2])[OH:3].[OH:4][C:5]>>[C:1](=[O:2])[O:4][C:5]"),
+    AllChem.ReactionFromSmarts("[OH:4][C:5].[C:1](=[O:2])[OH:3]>>[C:1](=[O:2])[O:4][C:5]"),
+    
+    # アミド化反応 (COOH + NH2)
+    AllChem.ReactionFromSmarts("[C:1](=[O:2])[OH:3].[NH2:4]>>[C:1](=[O:2])[NH:4]"),
+    AllChem.ReactionFromSmarts("[NH2:4].[C:1](=[O:2])[OH:3]>>[C:1](=[O:2])[NH:4]")
+]
+
+# ─── 3. ユーティリティ関数 ───
+def reacts(fg1, fg2):
+    """官能基の反応可能性を判定"""
+    # COOHはOHまたはNH2と反応
+    if fg1 == "COOH" and fg2 in {"OH", "NH2"}:
+        return True
+    # OHはCOOHとだけ反応
+    if fg1 == "OH" and fg2 == "COOH":
+        return True
+    # NH2はCOOHとだけ反応
+    if fg1 == "NH2" and fg2 == "COOH":
+        return True
+    return False
+
+def remove_one(counter, fg):
+    """官能基カウンタから1つ削除"""
+    if counter[fg] > 0:
+        counter[fg] -= 1
+        if counter[fg] == 0:
+            del counter[fg]
+
+def weighted_choice(ends):
+    """
+    元のモル比と官能基多重度を考慮したモノマー選択
+    - ends: 現在のポリマー鎖の末端官能基カウンタ
+    """
+    candidates = []
+    total_weight = 0
+    
+    for mono_key, ratio in mole_ratio.items():
+        mono_ends = monomers[mono_key]["ends"]
+        mono_end_counter = Counter(mono_ends)
+        weight = 0
+        
+        # 反応可能な官能基ペアの重み計算
+        for poly_fg, poly_count in ends.items():
+            for mono_fg, mono_count in mono_end_counter.items():
+                if reacts(poly_fg, mono_fg):
+                    # 重み = 鎖の官能基数 × モノマーの官能基数 × 元のモル比
+                    weight += poly_count * mono_count * ratio
+        
+        if weight > 0:
+            candidates.append((mono_key, weight))
+            total_weight += weight
+    
+    if not candidates:
+        return None
+    
+    # 重みに基づくランダム選択
+    rnd = random.uniform(0, total_weight)
+    cumulative = 0
+    for mono_key, weight in candidates:
+        cumulative += weight
+        if rnd <= cumulative:
+            return mono_key
+    
+    return candidates[-1][0] if candidates else None
+
+# ─── 4. メイン関数 ───
+def build_polymer(seed=None, max_attempts=1000):
+    if seed is not None:
+        random.seed(seed)
+    
+    # 開始モノマー選択（元のモル比に基づく）
+    start = random.choices(
+        list(mole_ratio.keys()), 
+        weights=list(mole_ratio.values()),
+        k=1
+    )[0]
+    
+    # 開始ポリマー鎖の初期化
+    polymer = Chem.MolFromSmiles(monomers[start]["smiles"])
+    Chem.SanitizeMol(polymer)
+    ends = Counter(monomers[start]["ends"])
+    seq = [start]
+    attempt_count = 0
+    
+    while len(seq) < TOTAL_UNITS and attempt_count < max_attempts:
+        # 次に反応させるモノマーを選択
+        nxt = weighted_choice(ends)
+        
+        # 反応可能なモノマーがない場合
+        if nxt is None:
+            attempt_count += 1
+            continue
+        
+        nxt_mol = Chem.MolFromSmiles(monomers[nxt]["smiles"])
+        Chem.SanitizeMol(nxt_mol)
+        nxt_end = Counter(monomers[nxt]["ends"])
+        success = False
+        
+        # 反応方向の試行（ポリマー-モノマー or モノマー-ポリマー）
+        for acid, base, a_end, b_end in [
+            (polymer, nxt_mol, ends.copy(), nxt_end.copy()),
+            (nxt_mol, polymer, nxt_end.copy(), ends.copy())
+        ]:
+            if success:
+                break
+                
+            for rxn in reactions:
+                prod = rxn.RunReactants((acid, base))
+                if prod:
+                    polymer = prod[0][0]
+                    Chem.SanitizeMol(polymer)
+                    
+                    # 消費された官能基の更新
+                    # 酸側の官能基を削除 (常にCOOH)
+                    remove_one(a_end, "COOH")
+                    
+                    # 塩基側の官能基を削除 (OHまたはNH2)
+                    if "OH" in b_end:
+                        remove_one(b_end, "OH")
+                    elif "NH2" in b_end:
+                        remove_one(b_end, "NH2")
+                    
+                    # 新たな末端官能基の結合
+                    ends = a_end + b_end
+                    seq.append(nxt)
+                    success = True
+                    break
+        
+        if success:
+            attempt_count = 0  # 成功したら失敗カウンタをリセット
+        else:
+            attempt_count += 1
+    
+    # 結果を返す
+    return Chem.MolToSmiles(polymer), len(seq), Counter(seq)
+
+# ─── 5. 実行と分析 ───
+def simulate_multiple_runs(n_runs=10):
+    results = []
+    for i in range(n_runs):
+        smi, dp, used = build_polymer(seed=i)
+        results.append((dp, used))
+        print(f"Run {i+1}: DP={dp}")
+    
+    return results
+
+def analyze_results(results):
+    # DPの統計
+    dps = [dp for dp, _ in results]
+    print(f"\nDegree of Polymerization:")
+    print(f"  Average: {np.mean(dps):.1f}")
+    print(f"  Min: {min(dps)}")
+    print(f"  Max: {max(dps)}")
+    print(f"  Std Dev: {np.std(dps):.1f}")
+    
+    # モノマー使用比率
+    total_used = sum(sum(used.values()) for _, used in results)
+    avg_ratio = {mono: sum(used.get(mono,0) for mono in monomers} 
+    avg_ratio = {k: v/total_used for k,v in avg_ratio.items()}
+    
+    print("\nMonomer Usage vs Initial Ratio:")
+    print("Monomer | Initial Ratio | Actual Ratio | Difference")
+    for mono in monomers:
+        init = mole_ratio[mono]
+        actual = avg_ratio.get(mono, 0)
+        diff = actual - init
+        print(f"{mono:6} | {init:12.3f} | {actual:12.3f} | {diff:9.3f}")
+
+# ─── 6. 可視化 ───
+def plot_results(results):
+    # DP分布
+    dps = [dp for dp, _ in results]
+    
+    plt.figure(figsize=(12, 8))
+    
+    # DP分布
+    plt.subplot(2, 2, 1)
+    plt.hist(dps, bins=20, alpha=0.7, color='skyblue')
+    plt.axvline(np.mean(dps), color='k', linestyle='dashed', linewidth=1)
+    plt.title(f'Degree of Polymerization (Avg={np.mean(dps):.1f})')
+    plt.xlabel('DP')
+    plt.ylabel('Frequency')
+    
+    # モノマー使用比率
+    plt.subplot(2, 2, 2)
+    total_used = sum(sum(used.values()) for _, used in results)
+    avg_ratio = {mono: sum(used.get(mono,0) for mono in monomers} 
+    avg_ratio = {k: v/total_used for k,v in avg_ratio.items()}
+    
+    labels = list(monomers.keys())
+    init_vals = [mole_ratio[k] for k in labels]
+    actual_vals = [avg_ratio.get(k, 0) for k in labels]
+    
+    x = np.arange(len(labels))
+    width = 0.35
+    plt.bar(x - width/2, init_vals, width, label='Initial Ratio', alpha=0.7)
+    plt.bar(x + width/2, actual_vals, width, label='Actual Ratio', alpha=0.7)
+    plt.xticks(x, labels)
+    plt.legend()
+    plt.title('Monomer Ratio Comparison')
+    plt.ylabel('Ratio')
+    
+    # 代表的なポリマー構造
+    plt.subplot(2, 2, 3)
+    _, _, used = results[0]  # 最初の実行結果を使用
+    most_common = max(used, key=used.get)
+    mol = Chem.MolFromSmiles(monomers[most_common]["smiles"])
+    img = Chem.Draw.MolToImage(mol)
+    plt.imshow(img)
+    plt.axis('off')
+    plt.title(f'Most Used Monomer: {most_common}')
+    
+    # 官能基反応ネットワーク
+    plt.subplot(2, 2, 4)
+    fg_types = ['COOH', 'OH', 'NH2']
+    reactions = [
+        ('COOH', 'OH'),
+        ('COOH', 'NH2')
+    ]
+    
+    # シンプルなネットワーク図
+    for i, fg in enumerate(fg_types):
+        plt.text(i, 0, fg, fontsize=14, ha='center', va='center', 
+                 bbox=dict(facecolor='lightblue', alpha=0.5, boxstyle='round'))
+    
+    for (src, tgt) in reactions:
+        src_idx = fg_types.index(src)
+        tgt_idx = fg_types.index(tgt)
+        plt.arrow(src_idx, -0.1, tgt_idx-src_idx, 0.2, 
+                  head_width=0.05, head_length=0.1, fc='k', ec='k')
+    
+    plt.xlim(-0.5, len(fg_types)-0.5)
+    plt.ylim(-0.5, 0.5)
+    plt.axis('off')
+    plt.title('Functional Group Reactions')
+    
+    plt.tight_layout()
+    plt.show()
+
+# ─── メイン実行 ───
+if __name__ == "__main__":
+    # 単一実行
+    smi, dp, used = build_polymer(seed=42)
+    print(f"Generated Polymer: {smi}")
+    print(f"Degree of Polymerization: {dp}")
+    print("Monomer Usage:", dict(used))
+    
+    # 複数実行と分析
+    results = simulate_multiple_runs(n_runs=20)
+    analyze_results(results)
+    plot_results(results)
